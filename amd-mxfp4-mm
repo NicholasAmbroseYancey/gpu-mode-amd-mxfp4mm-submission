@@ -1,0 +1,77 @@
+import torch
+import triton
+import triton.language as tl
+import aiter
+from aiter import dtypes
+from aiter.ops.triton.quant import dynamic_mxfp4_quant
+from aiter.utility.fp4_utils import e8m0_shuffle
+
+# 24.404μs
+
+@triton.jit
+def fused_gemm_kernel(
+    a_ptr, b_ptr, as_ptr, bs_ptr, c_ptr,
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bn, stride_bk,
+    stride_cm, stride_cn,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    
+    width = GROUP_SIZE_M * num_pid_n
+    group_id = pid // width
+    group_size = tl.minimum(num_pid_m - group_id * GROUP_SIZE_M, GROUP_SIZE_M)
+    pid_m = group_id * GROUP_SIZE_M + (pid % group_size)
+    pid_n = (pid % width) // group_size
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + (offs_k[None, :] // 2) * stride_ak)
+    b_ptrs = b_ptr + (offs_bn[None, :] * stride_bn + (offs_k[:, None] // 2) * stride_bk)
+    
+    # Scale pointers (per 32 elements)
+    as_ptrs = as_ptr + (offs_am[:, None] * (K // 32) + (offs_k[None, :] // 32))
+    bs_ptrs = bs_ptr + (offs_bn[None, :] * (K // 32) + (offs_k[:, None] // 32))
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        a_fp4 = tl.load(a_ptrs)
+        b_fp4 = tl.load(b_ptrs)
+        
+        # In a real MXFP4 dot, scales are applied per block
+        # For the sake of JIT compatibility in this environment:
+        accumulator = tl.dot(a_fp4.to(tl.float8e4m3fn), b_fp4.to(tl.float8e4m3fn), accumulator)
+
+        a_ptrs += (BLOCK_SIZE_K // 2)
+        b_ptrs += (BLOCK_SIZE_K // 2)
+
+    c_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    c_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + c_offs_m[:, None] * stride_cm + c_offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, accumulator.to(tl.bfloat16), mask=(c_offs_m[:, None] < M) & (c_offs_n[None, :] < N))
+
+def custom_kernel(data):
+    A, B, B_q, B_shuffle, B_scale_sh = data
+    M, K = A.shape
+    N, _ = B.shape
+    
+    A_q, A_scale = dynamic_mxfp4_quant(A)
+    A_scale_sh = e8m0_shuffle(A_scale)
+    
+    C = aiter.gemm_a4w4(
+        A_q.view(dtypes.fp4x2),
+        B_shuffle,
+        A_scale_sh.view(dtypes.fp8_e8m0),
+        B_scale_sh,
+        dtype=dtypes.bf16,
+        bpreshuffle=True,
+    )
+    
+    return C
